@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const CODE_LENGTH = 8;
+const CODE_LENGTH = 12;
 const MAX_BODY_BYTES = 8192;
 const MAX_SIGNAL_BYTES = 8192;
 const ROOM_LIFETIME_MS = 24 * 60 * 60 * 1000;
@@ -120,7 +120,7 @@ function constantTimeEqual(left, right) {
 }
 
 function validCode(code) {
-  return typeof code === "string" && /^[A-Z2-9]{8}$/.test(code);
+  return typeof code === "string" && /^(?:[A-Z2-9]{8}|[A-Z2-9]{12})$/.test(code);
 }
 
 function roomStub(env, code) {
@@ -231,7 +231,7 @@ export default {
       }
     }
 
-    const joinMatch = url.pathname.match(/^\/api\/rooms\/([A-Z2-9]{8})\/join$/);
+    const joinMatch = url.pathname.match(/^\/api\/rooms\/((?:[A-Z2-9]{8}|[A-Z2-9]{12}))\/join$/);
     if (request.method === "POST" && joinMatch) {
       try {
         const code = joinMatch[1];
@@ -264,7 +264,7 @@ export default {
       }
     }
 
-    const wsMatch = url.pathname.match(/^\/api\/rooms\/([A-Z2-9]{8})\/ws$/);
+    const wsMatch = url.pathname.match(/^\/api\/rooms\/((?:[A-Z2-9]{8}|[A-Z2-9]{12}))\/ws$/);
     if (wsMatch && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
       const stub = roomStub(env, wsMatch[1]);
       const internalUrl = new URL(request.url);
@@ -273,14 +273,14 @@ export default {
       return stub.fetch(new Request(internalUrl.toString(), request));
     }
 
-    const statusMatch = url.pathname.match(/^\/api\/rooms\/([A-Z2-9]{8})$/);
+    const statusMatch = url.pathname.match(/^\/api\/rooms\/((?:[A-Z2-9]{8}|[A-Z2-9]{12}))$/);
     if (request.method === "GET" && statusMatch) {
       const stub = roomStub(env, statusMatch[1]);
       const response = await stub.fetch("https://room.internal/_status");
       return withCors(response);
     }
 
-    const leaveMatch = url.pathname.match(/^\/api\/rooms\/([A-Z2-9]{8})\/leave$/);
+    const leaveMatch = url.pathname.match(/^\/api\/rooms\/((?:[A-Z2-9]{8}|[A-Z2-9]{12}))\/leave$/);
     if (request.method === "POST" && leaveMatch) {
       try {
         const body = await readJson(request);
