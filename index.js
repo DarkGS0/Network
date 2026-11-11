@@ -7,7 +7,7 @@ const MAX_SIGNAL_BYTES = 8192;
 const ROOM_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const ROOM_TOUCH_INTERVAL_MS = 60 * 60 * 1000;
 const IP_PREFIX = "10.77.0.";
-
+const MAX_KICK_RECORDS = 64;
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, OPTIONS",
@@ -59,7 +59,6 @@ async function readJson(request) {
   if (new TextEncoder().encode(raw).length > MAX_BODY_BYTES) {
     throw new Error("Request body is too large.");
   }
-
   if (!raw) return {};
   const value = JSON.parse(raw);
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -158,9 +157,8 @@ export default {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
-
     if (request.method === "GET" && url.pathname === "/") {
-      return text("Network relay is running.");
+      return text("Network signaling server is running.");
     }
 
     if (request.method === "GET" && url.pathname === "/health") {
@@ -180,7 +178,6 @@ export default {
         const peerName = cleanString(body.peerName, 24, "Host") || "Host";
         const password = cleanString(body.password, 64, "");
         const maxPeers = Number(body.maxPeers ?? 7);
-
         if (!Number.isInteger(maxPeers) || maxPeers < 2 || maxPeers > 7) {
           return json({ ok: false, error: "maxPeers must be between 2 and 7." }, 400);
         }
@@ -212,7 +209,6 @@ export default {
               }
             })
           });
-
           const result = await response.json();
           if (response.status === 409) continue;
           if (!response.ok) return json(result, response.status);
@@ -224,7 +220,6 @@ export default {
             webSocketUrl: socketUrl(request.url, code, peerId, token)
           }, 201);
         }
-
         return json({ ok: false, error: "Could not allocate a room. Try again." }, 503);
       } catch (error) {
         return json({ ok: false, error: error instanceof SyntaxError ? "Invalid JSON." : error.message }, 400);
@@ -252,7 +247,6 @@ export default {
         });
         const result = await response.json();
         if (!response.ok) return json(result, response.status);
-
         return json({
           ok: true,
           ...result,
@@ -296,6 +290,22 @@ export default {
       }
     }
 
+    const kickMatch = url.pathname.match(/^\/api\/rooms\/((?:[A-Z2-9]{8}|[A-Z2-9]{12}))\/kick$/);
+    if (request.method === "POST" && kickMatch) {
+      try {
+        const body = await readJson(request);
+        const stub = roomStub(env, kickMatch[1]);
+        const response = await stub.fetch("https://room.internal/_kick", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        return withCors(response);
+      } catch (error) {
+        return json({ ok: false, error: error instanceof SyntaxError ? "Invalid JSON." : error.message }, 400);
+      }
+    }
+
     return json({ ok: false, error: "Not found." }, 404);
   }
 };
@@ -327,13 +337,11 @@ export class Room extends DurableObject {
 
   async fetch(request) {
     const url = new URL(request.url);
-
     if (request.method === "POST" && url.pathname === "/_init") {
       const body = await request.json();
       if (await this.getRoom()) {
         return json({ ok: false, error: "Room code already exists." }, 409);
       }
-
       const now = Date.now();
       const room = {
         code: body.code,
@@ -345,13 +353,13 @@ export class Room extends DurableObject {
         lastActivity: now,
         expiresAt: now + ROOM_LIFETIME_MS,
         closed: false,
+        kickedPeers: [],
         peers: [{
           ...body.host,
           online: false,
           connectionId: null
         }]
       };
-
       await this.saveRoom(room);
       await this.ctx.storage.setAlarm(room.expiresAt);
       return json({ ok: true, ...publicRoom(room) }, 201);
@@ -361,7 +369,6 @@ export class Room extends DurableObject {
       const body = await request.json();
       const room = await this.getRoom();
       if (!room || room.closed) return json({ ok: false, error: "Room not found or closed." }, 404);
-
       const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
       const rateKey = `join-fail:${await sha256(clientIp)}`;
       const now = Date.now();
@@ -373,7 +380,6 @@ export class Room extends DurableObject {
       if (rate.count >= 10) {
         return json({ ok: false, error: "Too many attempts. Try again later." }, 429);
       }
-
       if (room.passwordHash) {
         const suppliedHash = await sha256(`${room.passwordSalt}:${body.password || ""}`);
         if (!constantTimeEqual(suppliedHash, room.passwordHash)) {
@@ -382,7 +388,6 @@ export class Room extends DurableObject {
           return json({ ok: false, error: "Incorrect room password." }, 403);
         }
       }
-
       const peerName = cleanString(body.peerName, 24, "Player") || "Player";
       const duplicateName = room.peers.some(peer => peer.name.toLowerCase() === peerName.toLowerCase());
       if (duplicateName) {
@@ -391,12 +396,10 @@ export class Room extends DurableObject {
       if (room.peers.length >= room.maxPeers) {
         return json({ ok: false, error: "Room is full." }, 409);
       }
-
       const usedSlots = new Set(room.peers.map(peer => Number(peer.ip.split(".").pop())));
       let slot = 2;
       while (slot <= 7 && usedSlots.has(slot)) slot++;
       if (slot > 7) return json({ ok: false, error: "No virtual IP addresses are available." }, 409);
-
       room.peers.push({
         id: body.peerId,
         name: peerName,
@@ -410,7 +413,6 @@ export class Room extends DurableObject {
       room.expiresAt = now + ROOM_LIFETIME_MS;
       await this.saveRoom(room);
       await this.ctx.storage.setAlarm(room.expiresAt);
-
       const peer = room.peers[room.peers.length - 1];
       return json({
         ok: true,
@@ -433,7 +435,6 @@ export class Room extends DurableObject {
       if (!peer || !constantTimeEqual(await sha256(body.token || ""), peer.tokenHash)) {
         return json({ ok: false, error: "Invalid peer credentials." }, 403);
       }
-
       if (peer.ip === `${IP_PREFIX}1`) {
         room.closed = true;
         await this.saveRoom(room);
@@ -443,11 +444,64 @@ export class Room extends DurableObject {
         await this.ctx.storage.setAlarm(Date.now() + 60 * 1000);
         return json({ ok: true, roomClosed: true });
       }
-
       room.peers = room.peers.filter(item => item.id !== peer.id);
       await this.saveRoom(room);
       this.broadcast({ type: "peer-left", peerId: peer.id });
       return json({ ok: true, roomClosed: false });
+    }
+
+    if (request.method === "POST" && url.pathname === "/_kick") {
+      const body = await request.json();
+      const room = await this.getRoom();
+      if (!room || room.closed) {
+        return json({ ok: false, error: "Room not found or closed." }, 404);
+      }
+
+      const host = room.peers.find(item => item.id === body.peerId);
+      const suppliedTokenHash = await sha256(body.token || "");
+      if (!host || !constantTimeEqual(suppliedTokenHash, host.tokenHash)) {
+        return json({ ok: false, error: "Invalid host credentials." }, 403);
+      }
+      if (host.ip !== `${IP_PREFIX}1`) {
+        return json({ ok: false, error: "Only the room host can kick players." }, 403);
+      }
+
+      const targetId = cleanString(body.targetPeerId, 64, "");
+      const target = room.peers.find(item => item.id === targetId);
+      if (!target || target.id === host.id) {
+        return json({ ok: false, error: "The selected player is no longer in this room." }, 404);
+      }
+
+      const hostName = cleanString(host.name, 24, "Host") || "Host";
+      if (!Array.isArray(room.kickedPeers)) room.kickedPeers = [];
+      room.kickedPeers = room.kickedPeers.filter(item => item.id !== target.id);
+      room.kickedPeers.push({
+        id: target.id,
+        tokenHash: target.tokenHash,
+        name: target.name,
+        hostName,
+        kickedAt: Date.now()
+      });
+      while (room.kickedPeers.length > MAX_KICK_RECORDS) room.kickedPeers.shift();
+
+      room.peers = room.peers.filter(item => item.id !== target.id);
+      room.lastActivity = Date.now();
+      room.expiresAt = room.lastActivity + ROOM_LIFETIME_MS;
+      await this.saveRoom(room);
+      await this.ctx.storage.setAlarm(room.expiresAt);
+
+      const kickNotice = JSON.stringify({ type: "kicked", hostName });
+      for (const socket of this.ctx.getWebSockets(target.id)) {
+        try { socket.send(kickNotice); } catch (_) { }
+        try { socket.close(4003, "Kicked by " + hostName); } catch (_) { }
+      }
+      this.broadcast({ type: "peer-left", peerId: target.id }, target.id);
+      return json({
+        ok: true,
+        kicked: true,
+        targetName: target.name,
+        wasOnline: Boolean(target.online)
+      });
     }
 
     if (request.method === "GET" && url.pathname === "/_ws") {
@@ -464,11 +518,26 @@ export class Room extends DurableObject {
 
     const room = await this.getRoom();
     if (!room || room.closed) return json({ ok: false, error: "Room not found or closed." }, 404);
-
     const peerId = url.searchParams.get("peer") || "";
     const token = url.searchParams.get("token") || "";
+    const tokenHash = await sha256(token);
     const peer = room.peers.find(item => item.id === peerId);
-    if (!peer || !constantTimeEqual(await sha256(token), peer.tokenHash)) {
+    if (!peer || !constantTimeEqual(tokenHash, peer.tokenHash)) {
+      const kicked = (room.kickedPeers || []).find(item =>
+        item.id === peerId && constantTimeEqual(tokenHash, item.tokenHash)
+      );
+      if (kicked) {
+        const pair = new WebSocketPair();
+        const client = pair[0];
+        const server = pair[1];
+        const connectionId = crypto.randomUUID();
+        this.ctx.acceptWebSocket(server, [peerId]);
+        server.serializeAttachment({ peerId, connectionId, kicked: true });
+        const hostName = cleanString(kicked.hostName, 24, "the room host") || "the room host";
+        try { server.send(JSON.stringify({ type: "kicked", hostName })); } catch (_) { }
+        try { server.close(4003, "Kicked by " + hostName); } catch (_) { }
+        return new Response(null, { status: 101, webSocket: client });
+      }
       return json({ ok: false, error: "Invalid peer credentials." }, 403);
     }
 
@@ -476,7 +545,6 @@ export class Room extends DurableObject {
     for (const oldSocket of oldSockets) {
       try { oldSocket.close(4001, "Reconnected"); } catch (_) { }
     }
-
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -487,7 +555,6 @@ export class Room extends DurableObject {
     room.lastActivity = Date.now();
     room.expiresAt = room.lastActivity + ROOM_LIFETIME_MS;
     await this.saveRoom(room);
-
     this.ctx.acceptWebSocket(server, [peerId]);
     server.serializeAttachment({ peerId, connectionId });
     server.send(JSON.stringify({
@@ -505,7 +572,6 @@ export class Room extends DurableObject {
         online: Boolean(item.online)
       }))
     }));
-
     this.broadcast({
       type: "peer-online",
       peer: { id: peer.id, name: peer.name, ip: peer.ip }
@@ -544,7 +610,6 @@ export class Room extends DurableObject {
       try { socket.send(JSON.stringify({ type: "error", error: "Invalid message." })); } catch (_) { }
       return;
     }
-
     let packet;
     try {
       packet = JSON.parse(message);
@@ -552,7 +617,6 @@ export class Room extends DurableObject {
       try { socket.send(JSON.stringify({ type: "error", error: "Invalid JSON." })); } catch (_) { }
       return;
     }
-
     if (!packet || typeof packet !== "object" || Array.isArray(packet)) return;
     if (packet.type === "ping") {
       const activeRoom = await this.getRoom();
@@ -565,14 +629,12 @@ export class Room extends DurableObject {
       try { socket.send(JSON.stringify({ type: "error", error: "Unsupported message type." })); } catch (_) { }
       return;
     }
-
     const room = await this.getRoom();
     if (!room || room.closed) return;
     const sender = room.peers.find(peer => peer.id === attachment.peerId);
     const targetId = cleanString(packet.to, 64, "");
     const target = room.peers.find(peer => peer.id === targetId);
     const kind = cleanString(packet.kind, 32, "");
-
     if (!sender || sender.connectionId !== attachment.connectionId || !target || target.id === sender.id) {
       try { socket.send(JSON.stringify({ type: "error", error: "Invalid signal destination." })); } catch (_) { }
       return;
@@ -581,14 +643,12 @@ export class Room extends DurableObject {
       try { socket.send(JSON.stringify({ type: "error", error: "Invalid signal kind." })); } catch (_) { }
       return;
     }
-
     let dataText;
     try { dataText = JSON.stringify(packet.data); } catch (_) { dataText = ""; }
     if (!dataText || new TextEncoder().encode(dataText).length > MAX_SIGNAL_BYTES) {
       try { socket.send(JSON.stringify({ type: "error", error: "Signal data is too large or invalid." })); } catch (_) { }
       return;
     }
-
     const delivered = this.sendToPeer(target.id, {
       type: "signal",
       from: sender.id,
@@ -605,7 +665,6 @@ export class Room extends DurableObject {
   async onSocketClosed(socket) {
     const attachment = socket.deserializeAttachment();
     if (!attachment) return;
-
     const room = await this.getRoom();
     if (!room) return;
     const peer = room.peers.find(item => item.id === attachment.peerId);
