@@ -11,6 +11,7 @@ const MAX_KICK_RECORDS = 64;
 const PENDING_PEER_TTL_MS = 150000;
 const MAX_ADMISSION_RTT_MS = 500;
 const MIN_ADMISSION_ROUND_TRIPS = 3;
+const MAX_ADMISSION_PROOFS = 7;
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, OPTIONS",
@@ -347,10 +348,10 @@ export class Room extends DurableObject {
     await this.saveRoom(room);
     for (const peer of expired) {
       for (const socket of this.ctx.getWebSockets(peer.id)) {
-        try { socket.send(JSON.stringify({ type: "admission-failed", reason: "Direct UDP connection was not established." })); } catch (_) { }
+        try { socket.send(JSON.stringify({ type: "admission-failed", reason: "A direct UDP connection to a room member was not established." })); } catch (_) { }
         try { socket.close(4002, "Direct UDP connection timed out"); } catch (_) { }
       }
-      this.sendPendingToHost({ type: "peer-pending-left", peerId: peer.id }, room);
+      this.sendPendingToAdmitted({ type: "peer-pending-left", peerId: peer.id }, room);
     }
     await this.scheduleRoomAlarm(room);
     return true;
@@ -452,9 +453,7 @@ export class Room extends DurableObject {
         online: false,
         connectionId: null,
         expiresAt: now + PENDING_PEER_TTL_MS,
-        readyFromGuest: false,
-        readyFromHost: false,
-        readyHostId: null
+        readyProofs: []
       };
       room.pendingPeers.push(peer);
       room.lastActivity = now;
@@ -489,7 +488,7 @@ export class Room extends DurableObject {
       if (pendingPeer) {
         room.pendingPeers = room.pendingPeers.filter(item => item.id !== pendingPeer.id);
         await this.saveRoom(room);
-        this.sendPendingToHost({ type: "peer-pending-left", peerId: pendingPeer.id }, room);
+        this.sendPendingToAdmitted({ type: "peer-pending-left", peerId: pendingPeer.id }, room);
         for (const ws of this.ctx.getWebSockets(pendingPeer.id)) {
           try { ws.close(4004, "Join cancelled"); } catch (_) { }
         }
@@ -620,7 +619,12 @@ export class Room extends DurableObject {
 
     peer.online = true;
     peer.connectionId = connectionId;
-    if (pending) peer.expiresAt = Date.now() + PENDING_PEER_TTL_MS;
+    if (pending) {
+      // Admission proofs are tied to the current WebSocket session on both ends.
+      // A reconnect must not reuse proof reports from an older session.
+      peer.readyProofs = [];
+      peer.expiresAt = Date.now() + PENDING_PEER_TTL_MS;
+    }
     room.lastActivity = Date.now();
     room.expiresAt = room.lastActivity + ROOM_LIFETIME_MS;
     await this.saveRoom(room);
@@ -636,7 +640,7 @@ export class Room extends DurableObject {
         maxPeers: room.maxPeers
       },
       self: { id: peer.id, name: peer.name, ip: peer.ip },
-      peers: room.peers.filter(item => item.id !== peer.id && (!pending || item.ip === `${IP_PREFIX}1`)).map(item => ({
+      peers: room.peers.filter(item => item.id !== peer.id).map(item => ({
         id: item.id,
         name: item.name,
         ip: item.ip,
@@ -645,7 +649,8 @@ export class Room extends DurableObject {
     }));
 
     if (pending) {
-      this.sendPendingToHost({
+      // Every admitted player can exchange direct candidates with a pending joiner.
+      this.sendPendingToAdmitted({
         type: "peer-pending",
         peer: { id: peer.id, name: peer.name, ip: peer.ip, online: true }
       }, room);
@@ -654,15 +659,13 @@ export class Room extends DurableObject {
         type: "peer-online",
         peer: { id: peer.id, name: peer.name, ip: peer.ip }
       }, room, peer.id);
-      // Restore pending ICE participants to a reconnecting admitted member.
-      if (peer.ip === `${IP_PREFIX}1`) {
-        for (const waiting of room.pendingPeers) {
-          if (!waiting.online) continue;
-          this.sendToPeer(peer.id, {
-            type: "peer-pending",
-            peer: { id: waiting.id, name: waiting.name, ip: waiting.ip, online: true }
-          });
-        }
+      // Restore pending ICE participants to any admitted member that reconnects.
+      for (const waiting of room.pendingPeers) {
+        if (!waiting.online) continue;
+        this.sendToPeer(peer.id, {
+          type: "peer-pending",
+          peer: { id: waiting.id, name: waiting.name, ip: waiting.ip, online: true }
+        });
       }
     }
 
@@ -700,9 +703,10 @@ export class Room extends DurableObject {
     }
   }
 
-  sendPendingToHost(payload, room) {
-    const host = (room.peers || []).find(peer => peer.ip === `${IP_PREFIX}1` && peer.online);
-    if (host) this.sendToPeer(host.id, payload);
+  sendPendingToAdmitted(payload, room) {
+    // WebSocket is used only for signaling. Each admitted peer negotiates its
+    // own direct UDP path to the pending participant; game packets never pass here.
+    this.broadcastToAdmitted(payload, room);
   }
 
   async webSocketMessage(socket, message) {
@@ -749,24 +753,70 @@ export class Room extends DurableObject {
         return;
       }
 
-      const host = room.peers.find(peer => peer.ip === `${IP_PREFIX}1`);
-      if (senderPending && targetActive && host && targetActive.id === host.id && targetActive.online) {
-        sender.readyFromGuest = true;
-        sender.readyHostId = host.id;
-        sender.expiresAt = Date.now() + PENDING_PEER_TTL_MS;
-      } else if (senderActive && senderActive.ip === `${IP_PREFIX}1` && targetPending &&
-                 host && senderActive.id === host.id && targetPending.online) {
-        targetPending.readyFromHost = true;
-        targetPending.readyHostId = host.id;
-        targetPending.expiresAt = Date.now() + PENDING_PEER_TTL_MS;
+      // A pending joiner may be admitted by proving a bidirectional direct path
+      // with any one online, already-admitted room member (not host-only).
+      let pendingTarget = null;
+      let verifiedMember = null;
+      let proofFromPending = false;
+      if (senderPending && sender.online && targetActive && targetActive.online) {
+        pendingTarget = sender;
+        verifiedMember = targetActive;
+        proofFromPending = true;
+      } else if (senderActive && senderActive.online && targetPending && targetPending.online) {
+        pendingTarget = targetPending;
+        verifiedMember = senderActive;
       } else {
-        try { socket.send(JSON.stringify({ type: "error", error: "Only a direct UDP path to the online room host can admit a pending player." })); } catch (_) { }
+        // A late duplicate report may arrive after the pending peer has already
+        // been admitted. It is harmless and should not create a noisy error.
+        if (senderActive && targetActive) return;
+        try { socket.send(JSON.stringify({ type: "error", error: "A pending player must verify a direct UDP path with an online room member." })); } catch (_) { }
         return;
       }
 
-      const pendingTarget = senderPending ? sender : targetPending;
-      if (pendingTarget && pendingTarget.readyFromGuest && pendingTarget.readyFromHost &&
-          pendingTarget.readyHostId && host && pendingTarget.readyHostId === host.id && host.online) {
+      if (!Array.isArray(pendingTarget.readyProofs)) pendingTarget.readyProofs = [];
+      const now = Date.now();
+      pendingTarget.readyProofs = pendingTarget.readyProofs.filter(proof =>
+        proof && typeof proof.peerId === "string" &&
+        Number.isFinite(Number(proof.updatedAt)) &&
+        now - Number(proof.updatedAt) >= 0 &&
+        now - Number(proof.updatedAt) <= PENDING_PEER_TTL_MS
+      );
+
+      let proof = pendingTarget.readyProofs.find(item => item.peerId === verifiedMember.id);
+      if (!proof) {
+        proof = {
+          peerId: verifiedMember.id,
+          pendingReady: false,
+          admittedReady: false,
+          pendingConnectionId: pendingTarget.connectionId,
+          admittedConnectionId: verifiedMember.connectionId,
+          updatedAt: now
+        };
+        pendingTarget.readyProofs.push(proof);
+      }
+      if (proofFromPending) {
+        proof.pendingReady = true;
+        proof.pendingConnectionId = pendingTarget.connectionId;
+      } else {
+        proof.admittedReady = true;
+        proof.admittedConnectionId = verifiedMember.connectionId;
+      }
+      proof.updatedAt = now;
+      pendingTarget.expiresAt = now + PENDING_PEER_TTL_MS;
+
+      // Bound stored proof records to the room's maximum player count.
+      pendingTarget.readyProofs.sort((left, right) => Number(right.updatedAt) - Number(left.updatedAt));
+      if (pendingTarget.readyProofs.length > MAX_ADMISSION_PROOFS) {
+        pendingTarget.readyProofs.length = MAX_ADMISSION_PROOFS;
+      }
+
+      const directMember = room.peers.find(item => item.id === proof.peerId && item.online &&
+        item.connectionId === proof.admittedConnectionId);
+      const samePendingConnection = pendingTarget.online && pendingTarget.connectionId &&
+        pendingTarget.connectionId === proof.pendingConnectionId;
+      if (proof.pendingReady && proof.admittedReady && directMember && samePendingConnection) {
+        // Promote only after both authenticated signaling sessions reported the
+        // same direct UDP peer and the sessions are still current.
         const admitted = {
           id: pendingTarget.id,
           name: pendingTarget.name,
@@ -782,9 +832,12 @@ export class Room extends DurableObject {
         room.expiresAt = room.lastActivity + ROOM_LIFETIME_MS;
         await this.saveRoom(room);
         const peerPayload = { id: admitted.id, name: admitted.name, ip: admitted.ip, online: true };
+        const host = room.peers.find(item => item.ip === `${IP_PREFIX}1`);
         this.sendToPeer(admitted.id, {
           type: "room-admitted",
-          hostPeerId: host.id,
+          hostPeerId: host ? host.id : "",
+          verifiedPeerId: directMember.id,
+          verifiedPeerName: directMember.name,
           peer: peerPayload,
           peers: room.peers.filter(peer => peer.id !== admitted.id).map(peer => ({
             id: peer.id, name: peer.name, ip: peer.ip, online: Boolean(peer.online)
@@ -809,12 +862,11 @@ export class Room extends DurableObject {
     const targetActive = room.peers.find(peer => peer.id === targetId);
     const targetPending = room.pendingPeers.find(peer => peer.id === targetId);
     const target = targetActive || targetPending;
-    const host = room.peers.find(peer => peer.ip === `${IP_PREFIX}1`);
     const touchesPending = Boolean(senderPending || targetPending);
-    const pendingSignalAllowed = !touchesPending || (host && (
-      (senderPending && targetActive && targetActive.id === host.id) ||
-      (senderActive && senderActive.id === host.id && targetPending)
-    ));
+    const pendingSignalAllowed = !touchesPending || (
+      (senderPending && senderPending.online && targetActive && targetActive.online) ||
+      (senderActive && senderActive.online && targetPending && targetPending.online)
+    );
     const kind = cleanString(packet.kind, 32, "");
     if (!target || target.id === sender.id || !pendingSignalAllowed) {
       try { socket.send(JSON.stringify({ type: "error", error: "Invalid or unauthorized signal destination." })); } catch (_) { }
@@ -861,7 +913,7 @@ export class Room extends DurableObject {
       pending.connectionId = null;
       pending.expiresAt = Date.now() + PENDING_PEER_TTL_MS;
       await this.saveRoom(room);
-      this.sendPendingToHost({ type: "peer-pending-left", peerId: pending.id }, room);
+      this.sendPendingToAdmitted({ type: "peer-pending-left", peerId: pending.id }, room);
       await this.scheduleRoomAlarm(room);
       return;
     }

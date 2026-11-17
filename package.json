@@ -1,8 +1,8 @@
 {
   "name": "network-relay",
-  "version": "1.0.0",
+  "version": "1.11.8",
   "private": true,
-  "description": "Signaling service for Network IPv4 UDP hole punching",
+  "description": "Network signaling service for direct UDP peer admission and room coordination",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev"
